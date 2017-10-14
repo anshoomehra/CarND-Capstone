@@ -5,6 +5,7 @@ from geometry_msgs.msg import PoseStamped
 from styx_msgs.msg import Lane, Waypoint
 
 import math
+from itertools import islice, cycle
 
 '''
 This node will publish waypoints from the car's current position to some `x` distance ahead.
@@ -28,25 +29,118 @@ class WaypointUpdater(object):
     def __init__(self):
         rospy.init_node('waypoint_updater')
 
+        # Subscribers
         rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
         rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
 
+        # Publishers
+        self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
         # TODO: Add a subscriber for /traffic_waypoint and /obstacle_waypoint below
 
+    # TODO: Add other member variables you need below
+        
+        # Waypoints Placeholders
+        self.base_waypoints = None
+        self.number_of_base_waypoints = None
 
-        self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
+        # Pose Placeholders
+        self.current_pose = None
+        self.car_x = None
+        self.car_y = None
 
-        # TODO: Add other member variables you need below
+        # Minimum Distance Placeholders
+        self.min_dist_from_car = 99999
+        self.min_dist_from_car_idx = None
 
+        # Velocity Placeholders
+        self.current_velocity = None
+        self.max_velocity = 1 # m/s
+        
         rospy.spin()
 
-    def pose_cb(self, msg):
-        # TODO: Implement
-        pass
+    def update_waypoints_velocity(self, waypoints):
+        for i in range(len(waypoints)):
+            waypoints[i].twist.twist.linear.x = self.max_velocity
 
-    def waypoints_cb(self, waypoints):
+        return waypoints
+
+    def send_final_waypoints(self):
+        car_x = self.current_pose.position.x
+        car_y = self.current_pose.position.y
+
+        wp_start_idx = 0
+        wp_end_idx = self.number_of_base_waypoints
+
+        if (self.min_dist_from_car_idx is not None):
+            wp_start_idx = self.min_dist_from_car_idx - 20
+            wp_end_idx = min( self.number_of_base_waypoints , self.min_dist_from_car_idx+20 )
+
+        # Find minimum distance car and it's index
+        for idx in range(wp_start_idx, wp_end_idx):
+            waypoint = self.base_waypoints[idx]
+            wp_x = waypoint.pose.pose.position.x
+            wp_y = waypoint.pose.pose.position.y
+
+            # Compute Distance : sqrt ( (x1-x2)^2 , (y1-y2)^2 )
+            distance = math.sqrt( (car_x - wp_x)**2 + (car_y - wp_y)**2 )
+
+            # Register minimum distance
+            if distance < self.min_dist_from_car:
+                self.min_dist_from_car = distance
+                self.min_dist_from_car_idx = idx
+
+        # Closest waypoint position ...
+        closest_wp_pos = self.base_waypoints[self.min_dist_from_car_idx].pose.pose.position
+
+        # Filter the waypoints which are ahead of the car
+        # Caution: Since it is loop, waypoints are cyclic,
+        #          hence using iterartor functions, cycle()
+        #          & islice() to get elements from start of
+        #          the index when list ends..
+        wps_ahead = list(islice(cycle(self.base_waypoints), self.min_dist_from_car_idx, self.min_dist_from_car_idx + LOOKAHEAD_WPS))
+
+        wps_with_velocity = self.update_waypoints_velocity(wps_ahead)
+
+        # Publish waypoints
+        rospy.loginfo("Publishing next waypoints to final_waypoints")
+        
+        lane = Lane()
+        lane.waypoints = wps_with_velocity
+        lane.header.stamp = rospy.Time(0)
+        self.final_waypoints_pub.publish(lane)
+
+    def pose_cb(self, PoseStampedMsg):
+        
+        rospy.loginfo("In Pose CB...")
         # TODO: Implement
-        pass
+
+        self.current_pose = PoseStampedMsg.pose
+        #Log Message Later ...
+        rospy.loginfo("Current Pose {} , {}, {}".format(self.current_pose.position.x,
+                                                        self.current_pose.position.y, 
+                                                        self.current_pose.position.z))
+
+        #Publish final waypoints ..
+        if self.base_waypoints is not None:
+            self.send_final_waypoints()
+        
+    def waypoints_cb(self, LaneMsg):
+
+        rospy.loginfo("In Waypoints CB...")
+        # TODO: Implement
+        
+        #Generate Waypoints (only ahead waypoints) based on present state
+        #final_waypoints = self.generate_final_waypoints()
+
+        # Log Message Later ...
+        #print ("Current Velocity:", waypoints.twist.twist.linear.x, waypoints.twist.twist.linear.y, waypoints.twist.twist.linear.z)
+        self.base_waypoints = LaneMsg.waypoints
+        self.number_of_base_waypoints = len(LaneMsg.waypoints)
+
+        rospy.loginfo("In Waypoints CB, total number of wapints {}...".format(self.number_of_base_waypoints))
+
+        #Publish final waypoints ..
+        self.send_final_waypoints()
 
     def traffic_cb(self, msg):
         # TODO: Callback for /traffic_waypoint message. Implement
