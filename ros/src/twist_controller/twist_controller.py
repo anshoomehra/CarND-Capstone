@@ -40,9 +40,11 @@ class Controller(object):
 		#self.s_lpf = LowPassFilter(tau = .2, ts = .1)
 		self.s_lpf = LowPassFilter(tau = 3, ts = 1)
 
+		self.COUNTER = 0
+
 	# control method: for any preprocessing of throttle, brake, yaw
 	def control(self, *args, **kwargs):
-
+		self.COUNTER += 1
 		# Retrieve present throttle, brake, steer
 		target_velocity_linear_x = args[0]
 		target_velocity_angular_z = args[1]
@@ -58,34 +60,56 @@ class Controller(object):
 			self.throttle.reset()
 			return 0, 0, 0
 
-		# Compute difference between target and current velocity as CTE for throttle. 
-		diff_velocity = target_velocity_linear_x - current_velocity_linear_x
+		if target_velocity_linear_x <= 0:
+			brake = abs(target_velocity_linear_x)
+			# if target_velocity_linear_x < 0:
+			# 	brake = 10000
+			# else:
+			# 	brake = target_velocity_linear_x
+			throttle = 0
+		else:
+			# Compute difference between target and current velocity as CTE for throttle. 
+			diff_velocity = target_velocity_linear_x - current_velocity_linear_x
 
-		current_time = rospy.get_time()
-		dt = 0
-		
-		# Compute Delta Time from last compute..
-		if self.prev_time is not None: 
-			dt = current_time - self.prev_time
-		self.prev_time = current_time
-		
-		velocity_controller = 0
-		
-		# Determine if throttle or braking is needed .. 
-		if dt > 0:
-			velocity_controller = self.throttle_pid.step(diff_velocity, dt)
-		if velocity_controller > 0:
-			throttle = velocity_controller
+			current_time = rospy.get_time()
+			dt = 0
+			
+			# Compute Delta Time from last compute..
+			if self.prev_time is not None: 
+				dt = current_time - self.prev_time
+			self.prev_time = current_time
+			
+			velocity_controller = 0
+			
+			# Determine if throttle or braking is needed .. 
+			if dt > 0:
+				velocity_controller = self.throttle_pid.step(diff_velocity, dt)
+			if velocity_controller > 0:
+				throttle = velocity_controller
 			# if throttle > 0.7 :  #### Needed for slow machines .. 
 			# 	throttle = 0.7
-		elif velocity_controller < 0:
-			# So braking should be ideaaly dependent in vehcile mass, air pressure ..
-			# wheel base etc, we are keeping it simple, as we do not have all the data ..
-			# Example : abs(self.total_mass * velocity_controller * self.wheel_base)
-			brake = -velocity_controller/2 # reducing braking to half, just my system ..
+		
+		# elif velocity_controller < 0:
+		# 	# So braking should be ideaaly dependent in vehcile mass, air pressure ..
+		# 	# wheel base etc, we are keeping it simple, as we do not have all the data ..
+		# 	# Example : abs(self.total_mass * velocity_controller * self.wheel_base)
+		# 	brake = -velocity_controller/2 # reducing braking to half, just my system ..
+
+		#rospy.loginfo ("target , brake: {}, {}".format(target_velocity_linear_x, brake))
 
 		# Define yaw from yaw conrtoller, given target and present linear, angular velocities ..
-		steering = self.yaw_controller.get_steering(target_velocity_linear_x, target_velocity_angular_z, current_velocity_linear_x)
+		steering = self.yaw_controller.get_steering(abs(target_velocity_linear_x), target_velocity_angular_z, current_velocity_linear_x)
 		steering = self.s_lpf.filt(steering)
+
+		# if self.COUNTER < 500:
+		# 	throttle = 1
+		# 	brake = 0
+		# else:
+		# 	throttle = 0
+		# 	brake = 2000
+
+
+		#rospy.loginfo("B: {}".format(brake))
+		#rospy.loginfo("T, B, S: {}, {}, {}".format( throttle, brake, steering))
 
 		return throttle, brake, steering
