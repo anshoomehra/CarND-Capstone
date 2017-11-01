@@ -9,49 +9,52 @@ import math
 from itertools import islice, cycle
 import copy
 
-'''
-This node will publish waypoints from the car's current position to some `x` distance ahead.
-
-As mentioned in the doc, you should ideally first implement a version which does not care
-about traffic lights or obstacles.
-
-Once you have created dbw_node, you will update this node to use the status of traffic lights too.
-
-Please note that our simulator also provides the exact location of traffic lights and their
-current status in `/vehicle/traffic_lights` message. You can use this message to build this node
-as well as to verify your TL classifier.
-
-TODO (for Yousuf and Aaron): Stopline location for each traffic light.
-'''
-
-LOOKAHEAD_WPS = 200 # Number of waypoints we will publish. You can change this number
+# Number of waypoints we will publish.
+LOOKAHEAD_WPS = 200 
 DEBUG = False
-# 1 meter/s = 2.23694 mph
-# Since the value being passed to pursuit as meter/s, below equation would give 8.95 meter/s
-# which should result into 20.020258 mph as max speed
-MAX_ACCL = 20./2.23693 
+
+# This index search waypoints ahead and behind present
+# Also act as reference for Acceleration
+SEARCH_INDEX = 20
+
+'''
+1 meter/s = 2.23694 mph
+Since the value being passed to pursuit as meter/s, below equation would give 8.95 meter/s
+which should result into 20.020258 mph as max speed
+'''
+MAX_ACCL = SEARCH_INDEX/2.23693
 MAX_DECEL = 1.
+MIN_VEL = 1.
+
+# This buffer act as bias to stop at ditance ahead or behind stop line.
+STOP_LINE_GAP = 3
 
 class WaypointUpdater(object):
 	def __init__(self):
 		rospy.init_node('waypoint_updater')
 
 	# Subscribers
-		# Provides base waypoints provided by Udacity Simulator, published only once..  
-		rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
 		# Provides current pose statistics of the car..
 		rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
+		
+		# Provides base waypoints provided by Udacity Simulator, published only once..  
+		self.base_wp_sub = rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
+
 		# Provides waypoint of ahead traffic light with red signal ..
 		rospy.Subscriber('/traffic_waypoint', Int32, self.traffic_cb)
 
+		# Provide linear and angular velocities
 		rospy.Subscriber('/current_velocity', TwistStamped, 
 						  self.current_velocity_cb)
 		
-		# TODO: Add a subscriber for /obstacle_waypoint below
 
 	# Publishers
 		# Publish computed final waypoints 
 		self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
+		
+		# TODO: Add a subscriber for /obstacle_waypoint below
+
+	# Other member variables you need below
 
 		# TL Placholders
 		self.tl_red_waypoint_idx = -1
@@ -68,125 +71,72 @@ class WaypointUpdater(object):
 
 		# Velocity Placeholders
 		self.current_velocity = None
-		self.max_velocity = 10./2.23693 # m/s
-		self.current_velocity = None
 		
 		# Loop until interrupt is issued as closing simulator or Ctrl+C as examples
+		#rospy.Rate(1)
 		rospy.spin()
 
-	# Compute velocity, and set each waypoint with target velocity .. 
-	def update_waypoints_velocity(self, waypoints):
-		for i in range(len(waypoints)):
-			waypoints[i].twist.twist.linear.x = self.max_velocity
-
-		return waypoints
-
+	'''
+	Helper Method for Acceleration Logic
+	From nearest waypoint to nearest waypoint + Lookahead index set defined max acceleration 
+	'''
 	def accelerate(self, lane):
 		for idx in range(self.min_dist_from_car_idx, self.min_dist_from_car_idx+LOOKAHEAD_WPS):
 			# Ensure index is not out range and is cyclic
 			idx = idx % self.number_of_base_waypoints
-			# Update the target velocity along ..
+			# Update the target velocity 
 			self.set_waypoint_velocity(self.base_waypoints, idx , MAX_ACCL)
 			# Add to the list of final waypoints 
 			lane.waypoints.append(self.base_waypoints[idx])
+
 		return lane
 
-	def euclidean_distance_2d(self, position1, position2):
-		a = position1
-		b = position2
-		return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
+	'''
+	Helper method to find Euclidean Distance
+	Input: Position Vector for target and source
+	Output: Distance in defined units (in this case meters) 
+	'''
+	def euclidean_distance3D(self, position1, position2):
+		eucDst = lambda p1, p2 : math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+		return eucDst(position1, position2)
 
+	'''
+	Helper Method for Deceleration Logic
+	'''
 	def decelerate(self, lane):
-		last = self.base_waypoints[self.tl_red_waypoint_idx]
-		#last.twist.twist.linear.x = 0.
-		target_velocity = 0.
-		wp_rev_idx = self.tl_red_waypoint_idx 
-		
-		#for wp_idx in range(self.tl_red_waypoint_idx, self.min_dist_from_car_idx, -1):
-		for wp_idx in range(self.min_dist_from_car_idx, self.tl_red_waypoint_idx):
-			wp = self.base_waypoints[wp_idx]
-			dist = self.euclidean_distance_2d(self.base_waypoints[wp_rev_idx].pose.pose.position, last.pose.pose.position)
-			#vel = math.sqrt(2 * MAX_DECEL * dist)
-			initial_velocity =  self.current_velocity.linear.x
-			
-			vel = round(( (target_velocity)**2 - (initial_velocity)**2 ) / 2 * dist, 2) 
+		last_wp = self.base_waypoints[self.tl_red_waypoint_idx+STOP_LINE_GAP]
+		last_wp.twist.twist.linear.x = 0.
 
-			if wp_idx > self.tl_red_waypoint_idx-25:
-				vel = -50000
-			
-			#rospy.loginfo("WP, DIST, CV, NV: {}, {}, {}, {}".format(wp_idx, dist, initial_velocity, vel))
+		# From nearest waypoint to traffic light stop point define linear deceleration 
+		for idx in range ( self.tl_red_waypoint_idx+STOP_LINE_GAP, self.min_dist_from_car_idx, -1):
+			wp = self.base_waypoints[idx]
+			dist = self.euclidean_distance3D(wp.pose.pose.position, last_wp.pose.pose.position)
+			vel = math.sqrt(2 * MAX_DECEL * dist)
 
-			#if vel < 1.:
-			#	vel = 0.
-			wp.twist.twist.linear.x = vel #min(vel, wp.twist.twist.linear.x)
+			if vel < 1.:
+				vel = 0.
 			
-			lane.waypoints.append(wp)
-			wp_rev_idx -= 1
-			#rospy.loginfo("WP Idx, Vel: {}, {}".format(wp_idx, vel))
-		
+			wp.twist.twist.linear.x = min(vel, wp.twist.twist.linear.x)
+			lane.waypoints.append(wp)			
+
 		return lane
 
-	# def decelerate(self, lane):
-	# 	## Document
-	# 	'''
-	# 	Experimental Ground
-	# 	'''
+	# Helper method to get waypoint velocity
+	def get_waypoint_velocity(self, waypoint):
+		return waypoint.twist.twist.linear.x
 
-	# 	# distToNextWP = self.euclidean_distance_2d(self.current_pose.position, self.base_waypoints[self.min_dist_from_car_idx].pose.pose.position)
-	# 	# stopDist = distToNextWP + self.distance(self.base_waypoints, self.min_dist_from_car_idx, self.tl_red_waypoint_idx)
-	# 	# fullStopVelocity = math.sqrt(2 * MAX_DECEL * stopDist)
+	# Helper method to set waypoint velocity
+	def set_waypoint_velocity(self, waypoints, waypoint, velocity):
+		waypoints[waypoint].twist.twist.linear.x = velocity
 
-	# 	# #Target Velocity
-	# 	# v0 = min(fullStopVelocity, self.base_waypoints[self.min_dist_from_car_idx].twist.twist.linear.x)
-
-	# 	# for i in range (self.min_dist_from_car_idx, self.tl_red_waypoint_idx): #self.min_dist_from_car_idx+LOOKAHEAD_WPS):
-
-	# 	# 	#newWpVelocity = v0 * max(0., stopDist - distToNextWP) / stopDist
-	# 	# 	newWpVelocity = v0 * (stopDist - distToNextWP) / stopDist
-			
-	# 	# 	#rospy.loginfo("New WP Velocity at inxdex: {}, {}".format(i, newWpVelocity))
-	# 	# 	#rospy.loginfo("nwp, rwp, distToNextWP, stopDist, fullStopVelocity, v0, newWpVelocity: {}, {}, {}, {}, {}, {}, {}".format(self.current_pose.position.x, self.base_waypoints[self.min_dist_from_car_idx].pose.pose.position.x, self.min_dist_from_car_idx, self.tl_red_waypoint_idx, distToNextWP, stopDist, fullStopVelocity, v0, newWpVelocity))
-
-	# 	# 	#if newWpVelocity < 0.1:
-	# 	# 	#	newWpVelocity = 0.
-
-	# 	# 	wp = copy.deepcopy(self.base_waypoints[i])
-	# 	# 	wp.twist.twist.linear.x  = newWpVelocity
-
-	# 	# 	lane.waypoints.append(wp)
-
-	# 	# 	if (i < self.tl_red_waypoint_idx):
-	# 	# 		distToNextWP += self.distance(self.base_waypoints, i, i+1)
-	# 	# 		#rospy.loginfo("Distance to Next WP at index: {}, {}".format(i, distToNextWP))
-
-	# 	# return lane
-		
-	# 	for idx in range(self.min_dist_from_car_idx, self.tl_red_waypoint_idx):
-	# 		# Initial, Target Velocity & Distance to stop point
-	# 		initial_velocity =  self.current_velocity.linear.x
-	# 		target_velocity = 0.
-	# 		distance_to_stop_line = self.distance(self.base_waypoints, idx, self.tl_red_waypoint_idx)
-
-	# 		# 	# Deceleration Formula
-	# 		# 	# -*- coding: utf-8 -*-
-	# 		# 	# -a = ( v - u ) / t  :: v: Final Velocity, u: Initial Velocity, t: time to decelerate
-	# 		# 	# -a = (v**2 -u**2) / 2s  :: v: Final Velocity, u: Initial Velocity, s: ditance to travel
-	# 		new_acceleration = round(( (target_velocity)**2 - (initial_velocity)**2 ) / 2 * distance_to_stop_line, 2) 
-
-	# 		rospy.loginfo("Distance, New Acc: {}, {}".format(distance_to_stop_line, new_acceleration))
-	# 		#rospy.loginfo("**Debug Idx, MinCarIdx, TLIdx, DistToStop, IdxVel, NewAcc: {}, {}, {}, {}, {}, {}".format(idx, min_dist_from_car_idx, self.tl_red_waypoint_idx, distance_to_stop_line, initial_velocity, new_acceleration ))
-	# 		# if new_acceleration < 0:
-	# 		# 	new_acceleration = 0
-
-	# 		# Ensure index is not out range and is cyclic
-	# 		idx = idx % self.number_of_base_waypoints
-	# 		# Update the target velocity along ..
-	# 		self.set_waypoint_velocity(self.base_waypoints, idx , new_acceleration)
-	# 		# Add to the list of final waypoints 
-	# 		lane.waypoints.append(self.base_waypoints[idx])
-		
-	# 	return lane
-		
+	# Helper method to get Eucledian Distance with inputs as waypoints
+	def distance(self, waypoints, wp1, wp2):
+		dist = 0
+		dl = lambda a, b: math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2  + (a.z-b.z)**2)
+		for i in range(wp1, wp2+1):
+			dist += dl(waypoints[wp1].pose.pose.position, waypoints[i].pose.pose.position)
+			wp1 = i
+		return dist
 
 	# Helper Method:
 	# Compute Final Waypoints, and publish them to /final_waypoints node
@@ -195,20 +145,17 @@ class WaypointUpdater(object):
 		car_x = self.current_pose.position.x
 		car_y = self.current_pose.position.y
 
-		# Minimum Waypoint Distance Placeholders
-		self.min_dist_from_car = 99999
-
+		# Minimum Distance Placeholders
+		min_dist_from_car = 99999
+		
 		# Local Placeholders 
 		wp_start_idx = 0 # Index to compute waypoints from base list
 		wp_end_idx = self.number_of_base_waypoints # Index until computing waypoints from base list 
 
-		# If this is true, it means it is not the first time this event has triggered
-		# set the start and end index according to where car is, 20 before and either 
-		# 20 after or number of total waypoints whichever is less .. 
-		# instead of looping all waypoints to gain performance .. 
+		# Limit Search for nearest waypoint using search index for performance reasons
 		if (self.min_dist_from_car_idx is not None):
-			wp_start_idx = self.min_dist_from_car_idx #- 100  #[ remove minus ]
-			wp_end_idx = min( self.number_of_base_waypoints , self.min_dist_from_car_idx+200 )
+			wp_start_idx = self.min_dist_from_car_idx - SEARCH_INDEX
+			wp_end_idx = min( self.number_of_base_waypoints , self.min_dist_from_car_idx+SEARCH_INDEX )
 
 		# Find minimum distance car and it's index
 		for idx in range(wp_start_idx, wp_end_idx):
@@ -220,183 +167,86 @@ class WaypointUpdater(object):
 			distance = math.sqrt( (car_x - wp_x)**2 + (car_y - wp_y)**2 )
 
 			# Register minimum distance
-			if distance < self.min_dist_from_car:
-				self.min_dist_from_car = distance
+			if distance < min_dist_from_car:
+				min_dist_from_car = distance
 				self.min_dist_from_car_idx = idx
 
-		# Closest waypoint position ... For Logging ..
-		#closest_wp_pos = self.base_waypoints[self.min_dist_from_car_idx].pose.pose.position
-
 		lane = Lane()
-
-		# Filter the waypoints which are ahead of the car
-		# Caution: Since it is loop, waypoints are cyclic,
-		#          ensure loop s index back ..
-		#rospy.loginfo("red Light waypoint index: {}".format(self.tl_red_waypoint_idx))
-
-		#if self.tl_red_waypoint_idx is None or self.tl_red_waypoint_idx < 0 or (self.min_dist_from_car_idx % self.number_of_base_waypoints) > self.tl_red_waypoint_idx:
-
-		#rospy.loginfo ("Idx, TLIdx, NWP, Cond, DTL: {}, {}, {}, {}, {}".format(self.min_dist_from_car_idx, self.tl_red_waypoint_idx, self.number_of_base_waypoints, ((self.min_dist_from_car_idx % self.number_of_base_waypoints) > self.tl_red_waypoint_idx), (self.tl_red_waypoint_idx-self.min_dist_from_car_idx)))
 		
-		#if self.tl_red_waypoint_idx is None or self.tl_red_waypoint_idx < 0 or self.min_dist_from_car_idx < (self.tl_red_waypoint_idx - 100):
-			## Document acceleration logic ..
-
-		'''
-		Experimentation Ground .. 
-		'''
-
-		# if self.tl_red_waypoint_idx is None or self.tl_red_waypoint_idx < 0:
-		# 	#rospy.loginfo("Accelerate")
-		# 	lane = self.accelerate(lane)
-		# else:
-		# 	if self.min_dist_from_car_idx >= self.tl_red_waypoint_idx: ### Need to fix = or reduce wp-5
-		# 		#rospy.loginfo("Accelerate")
-		# 		lane = self.accelerate(lane)
-		# 	else:
-		# 		distance_to_tl = self.tl_red_waypoint_idx-self.min_dist_from_car_idx
-		# 		if distance_to_tl > 0 and distance_to_tl < 200:
-		# 			rospy.loginfo("Decelerate")
-		# 			lane = self.decelerate(lane)
-		# 		else:
-		# 			#rospy.loginfo("Accelerate")
-		# 			lane = self.accelerate(lane)
-
-		#lane = self.accelerate(lane)
+		# Logic deciding when to Accelerate vs Decelerate
+		# Decelerate only if car is at distance of SEARCH_INDEX (meters)
 		if self.tl_red_waypoint_idx is None or self.tl_red_waypoint_idx < 0:
-			#rospy.loginfo("Accelerate")
+			if DEBUG:
+				rospy.loginfo("Accelerate")
 			lane = self.accelerate(lane)
 		else:
-			distance_to_tl = self.distance(self.base_waypoints, self.min_dist_from_car_idx, self.tl_red_waypoint_idx)
-			if distance_to_tl > 0 and distance_to_tl < 100:
-				#rospy.loginfo("Decelerate")
-				lane = self.decelerate(lane)
+			if self.min_dist_from_car_idx >= self.tl_red_waypoint_idx:
+				if DEBUG :
+					rospy.loginfo("Accelerate")
+				lane = self.accelerate(lane) 
 			else:
-				#rospy.loginfo("Accelerate")
-				lane = self.accelerate(lane)
+				distance_to_tl = self.euclidean_distance3D(self.base_waypoints[self.min_dist_from_car_idx].pose.pose.position, self.base_waypoints[self.tl_red_waypoint_idx].pose.pose.position)
+				if distance_to_tl > 0 and distance_to_tl < SEARCH_INDEX:
+					if DEBUG:
+						rospy.loginfo("Decelerate")
+					lane = self.decelerate(lane)
+				else:
+					if DEBUG:
+						rospy.loginfo("Accelerate")
+					lane = self.accelerate(lane)
 
-		#lane = self.accelerate(self.min_dist_from_car_idx, lane)
+		# Waypoints, and velocities are set, time to Publish waypoints to /final_waypoints node ..
+		if DEBUG :
+			rospy.loginfo("Publishing next waypoints to final_waypoints")
 
-		# for idx in range(self.min_dist_from_car_idx, self.min_dist_from_car_idx+LOOKAHEAD_WPS):
-		# 	# Ensure index is not out range and is cyclic
-		# 	idx = idx % self.number_of_base_waypoints
-		# 	# Update the target velocity along ..
-		# 	self.set_waypoint_velocity(self.base_waypoints, idx , 20./2.23693)
-		# 	# Add to the list of final waypoints 
-		# 	lane.waypoints.append(self.base_waypoints[idx])
-		# #else:
-			## Document deceleration logic
-			
-
-		# else: # We have stop light ahead, set the gradual decrease in velocity ..
-		# 	# Deceleration Formula
-		# 	# -*- coding: utf-8 -*-
-		# 	# -a = ( v - u ) / t  :: v: Final Velocity, u: Initial Velocity, t: time to decelerate
-		# 	# -a = (v**2 -u**2) / 2s  :: v: Final Velocity, u: Initial Velocity, s: ditance to travel
-
-		# 	for idx in range(self.min_dist_from_car_idx, self.tl_red_waypoint_idx):
-
-		# 		# Initial, Target Velocity & Distance to stop point
-		# 		initial_velocity =  self.current_velocity.linear.x #self.get_waypoint_velocity(self.base_waypoints[idx]) ### This is coming zero ..
-		# 		#initial_velocity = self.current_pose.
-		# 		target_velocity = 0.
-		# 		distance_to_stop_line = self.distance(self.base_waypoints, idx, self.tl_red_waypoint_idx)
-
-		# 		new_acceleration = ( (target_velocity)**2 - (initial_velocity)**2 ) / 2 * distance_to_stop_line
-
-		# 		rospy.loginfo("**Debug Idx, MinCarIdx, TLIdx, DistToStop, IdxVel, NewAcc: {}, {}, {}, {}, {}, {}".format(idx, self.min_dist_from_car_idx, self.tl_red_waypoint_idx, distance_to_stop_line, initial_velocity, new_acceleration ))
-		# 		if new_acceleration < 0:
-		# 			new_acceleration = 0
-
-		# 		# Ensure index is not out range and is cyclic
-		# 		idx = idx % self.number_of_base_waypoints
-		# 		# Update the target velocity along ..
-		# 		self.set_waypoint_velocity(self.base_waypoints, idx , new_acceleration)
-		# 		# Add to the list of final waypoints 
-		# 		lane.waypoints.append(self.base_waypoints[idx])
-
-		# if DEBUG :
-		# 	rospy.loginfo("Publishing next waypoints to final_waypoints")
-
-		# for i in range (270, 291):
-		# 	temp_dist = self.distance(self.base_waypoints, i, i+1)
-		# 	rospy.loginfo("Distance Between waypints {} & {} is : {}".format(i, i+1, temp_dist) )
-
-		# #Waypoints, and velocities are set, time to Publish waypoints 
-		#to /final_waypoints node ..
 		self.final_waypoints_pub.publish(lane)
 
-	# Call Back Method for /traffic_waypoint:
-	# Retrieve TL Red Waypoints..
-	def traffic_cb(self, msg):
-		#rospy.loginfo("In Traffic CB")
-		self.tl_red_waypoint_idx = msg.data        
-		#rospy.loginfo("Detected light: " + str(msg.data))
-		if self.base_waypoints is not None: #self.tl_red_waypoint_idx > -1:
-			self.send_final_waypoints()
-			
 	# Call Back Method for /current_pose:
-	# Compute Final Waypoints, and publish them to /final_waypoints node
 	def pose_cb(self, PoseStampedMsg):
 		
-		#if DEBUG :
-		#rospy.loginfo("In Pose CB...")
-		# TODO: Implement
+		if DEBUG :
+			rospy.loginfo("In Pose CB...")
 
 		self.current_pose = PoseStampedMsg.pose
-		#Log Message Later ...
+
 		if DEBUG :
 			rospy.loginfo("Current Pose {} , {}, {}".format(self.current_pose.position.x,
 															self.current_pose.position.y, 
 															self.current_pose.position.z))
 
 		# Publish final waypoints ..
-		## Wait until base_waypoits are published, call backs are not in sequence &
-		## are unpredictable, need to assert required variables prior processing .. 
-		#if self.base_waypoints is not None: 
-		#	self.send_final_waypoints()
+		# Wait until base_waypoits are published, call backs are not in sequence &
+		# are unpredictable, need to assert required variables prior processing .. 
+		if self.base_waypoints is not None: 
+			self.send_final_waypoints()
  
-	# Call Back Method for /base_waypoints:
-	# Compute Final Waypoints, and publish them to /final_waypoints node
+	# Call Back Method for /base_waypoints: -- only publishes once in lifecycle
 	def waypoints_cb(self, LaneMsg):
 
 		if DEBUG :
 			rospy.loginfo("In Waypoints CB...")
 
-		# Log Message Later ...
-		#print ("Current Velocity:", waypoints.twist.twist.linear.x, waypoints.twist.twist.linear.y, waypoints.twist.twist.linear.z)
 		self.base_waypoints = LaneMsg.waypoints
 		self.number_of_base_waypoints = len(LaneMsg.waypoints)
 
 		if DEBUG :
 			rospy.loginfo("In Waypoints CB, total number of waypoints {}...".format(self.number_of_base_waypoints))
 
-		# Publish final waypoints ..
-		## Wait until base_waypoits are published, call backs are not in sequence &
-		## are unpredictable, need to assert required variables prior processing .. 
-		if self.current_pose is not None:
-			self.send_final_waypoints()
+		# Unregister after receiving base-waypoints to gain performance
+		self.base_wp_sub.unregister()
+		self.base_wp_sub = None
 
+	# Call Back Method for /traffic_waypoint
+	def traffic_cb(self, msg):
+		self.tl_red_waypoint_idx = msg.data 
+
+	# Call Back Method for obstacle
 	def obstacle_cb(self, msg):
-		# TODO: Callback for /obstacle_waypoint message. We will implement it later
 		pass
 
-	## Call back funtion for /current_velocity
+	# Call back method for /current_velocity
 	def current_velocity_cb(self, TwistStampedMsg):
 		self.current_velocity = TwistStampedMsg.twist
-
-	def get_waypoint_velocity(self, waypoint):
-		return waypoint.twist.twist.linear.x
-
-	def set_waypoint_velocity(self, waypoints, waypoint, velocity):
-		waypoints[waypoint].twist.twist.linear.x = velocity
-
-	def distance(self, waypoints, wp1, wp2):
-		dist = 0
-		dl = lambda a, b: math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2  + (a.z-b.z)**2)
-		for i in range(wp1, wp2+1):
-			dist += dl(waypoints[wp1].pose.pose.position, waypoints[i].pose.pose.position)
-			wp1 = i
-		return dist
 
 # MAIN : Call WaypointUpdater(), which will run indefinite until interrupt is
 # trigerred ..
